@@ -1,0 +1,196 @@
+/*
+  core/selftest.cpp  -- Power-On Self-Test. See selftest.h for the "why".
+
+  Kept deliberately self-contained (raw I2C for the SHT41, direct radio
+  scans) so it tests the hardware itself, not our higher-level drivers.
+
+  LED feedback style follows Pak Leo's version: fast, compact blinks on pass,
+  and a simple alternating blink code on failure.
+*/
+
+#include "selftest.h"
+#include "log.h"
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <BLEDevice.h>
+#include <BLEScan.h>
+
+#include "config.h"
+#include "drivers/Battery.h"
+
+
+// ---- tunables ----
+static const uint32_t BLE_SCAN_SECONDS = 5;
+static const float    BATT_PASS_V      = 3.5f;   // >= this -> healthy, blink 4x
+static const float    BATT_CONNECTED_V = 1.0f;   // below this -> "no battery"
+
+
+// ==================================================================
+//  LED helpers (respect LED_ACTIVE_LEVEL from config.h)
+// ==================================================================
+static inline void powerLed(bool on) {
+    digitalWrite(PIN_LED_POWER, on ? LED_ACTIVE_LEVEL : !LED_ACTIVE_LEVEL);
+}
+static inline void statusLed(bool on) {
+    digitalWrite(PIN_LED_STATUS, on ? LED_ACTIVE_LEVEL : !LED_ACTIVE_LEVEL);
+}
+
+// Show that test `n` passed, quickly. A brief power-LED step marks the test
+// boundary (just ON for test 1; OFF 0.2 s then ON 0.2 s for tests 2-4), then
+// `n` fast status blinks (0.1 s on / 0.1 s off), then a 0.1 s gap.
+static void passIndicate(uint8_t n) {
+    if (n == 1) {
+        powerLed(true);  delay(100);
+    } else {
+        powerLed(false); delay(100);
+        powerLed(true);  delay(200);
+    }
+    for (uint8_t i = 0; i < n; i++) {
+        statusLed(true);  delay(100);
+        statusLed(false); delay(100);
+    }
+}
+
+
+// ==================================================================
+//  TEST 1 : SHT41 over I2C (raw, with CRC-8 check)
+// ==================================================================
+static uint8_t sht41Crc(const uint8_t* d, uint8_t n) {
+    uint8_t crc = 0xFF;
+    for (uint8_t i = 0; i < n; i++) {
+        crc ^= d[i];
+        for (uint8_t b = 0; b < 8; b++)
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
+    }
+    return crc;
+}
+
+static bool testSHT41() {
+    Wire.beginTransmission(I2C_ADDR_SHT41);
+    Wire.write(0xFD);                       // high-precision measure
+    if (Wire.endTransmission() != 0) return false;   // no ACK
+
+    delay(10);                               // ~8.3 ms conversion
+
+    uint8_t buf[6];
+    if (Wire.requestFrom((int)I2C_ADDR_SHT41, 6) != 6) return false;
+    for (uint8_t i = 0; i < 6; i++) buf[i] = Wire.read();
+
+    // Both CRC bytes must match, otherwise the bus/sensor is faulty.
+    return (sht41Crc(&buf[0], 2) == buf[2]) && (sht41Crc(&buf[3], 2) == buf[5]);
+}
+
+
+// ==================================================================
+//  TEST 2 : WiFi radio -- at least one SSID visible
+// ==================================================================
+static bool testWiFi() {
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect(false);
+    delay(100);
+    int n = WiFi.scanNetworks(false /*async*/, true /*hidden*/);
+    WiFi.scanDelete();
+    WiFi.mode(WIFI_OFF);
+    return (n > 0);
+}
+
+
+// ==================================================================
+//  TEST 3 : BLE radio -- at least one device visible
+// ==================================================================
+static bool testBLE() {
+    BLEDevice::init("");
+    BLEScan* scan = BLEDevice::getScan();
+    scan->setActiveScan(true);
+    scan->setInterval(100);
+    scan->setWindow(99);
+
+    // arduino-esp32 changed BLEScan::start()'s return type between core
+    // versions: v3.x returns a BLEScanResults* (pointer), v2.x returns a
+    // BLEScanResults (value). Guard so this file compiles on BOTH.
+#if defined(ESP_ARDUINO_VERSION) && ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+    BLEScanResults* results = scan->start(BLE_SCAN_SECONDS, false);
+    int count = results ? results->getCount() : 0;
+#else
+    BLEScanResults results = scan->start(BLE_SCAN_SECONDS, false);
+    int count = results.getCount();
+#endif
+
+    scan->clearResults();
+    BLEDevice::deinit(true);   // release the controller for WiFi later
+    return (count > 0);
+}
+
+
+// ==================================================================
+//  Failure handler -- never returns. Encodes WHICH test failed: the two LEDs
+//  alternate for `failedTest` fast blinks (STATUS 0.1 s on / 0.1 s off, POWER
+//  opposite), then a 0.3 s pause, repeating forever. Count the STATUS flashes:
+//  1 = SHT41, 2 = WiFi, 3 = BLE.
+// ==================================================================
+static void failLoop(uint8_t failedTest) {
+    powerLed(false); statusLed(false);
+    for (;;) {
+        for (uint8_t i = 0; i < failedTest; i++) {
+            statusLed(true);  powerLed(false); delay(100);
+            statusLed(false); powerLed(true);  delay(100);
+        }
+        powerLed(false); statusLed(false);
+        delay(300);                                  // pause, then repeat
+    }
+}
+
+
+// ==================================================================
+//  Master self-test
+// ==================================================================
+bool selftest_run() {
+    LOG.println("\n===== STAYCOOL Power-On Self-Test =====");
+
+    // LED pins + power the SHT41 (P-ch MOSFET LOW = ON) for the I2C test.
+    pinMode(PIN_LED_POWER,   OUTPUT);
+    pinMode(PIN_LED_STATUS,  OUTPUT);
+    pinMode(PIN_SHT41_POWER, OUTPUT);
+    digitalWrite(PIN_SHT41_POWER, LOW);
+    powerLed(false); statusLed(false);   // start dark; passIndicate() drives the LEDs
+    delay(10);
+
+    // ---- Test 1: SHT41 ----
+    Wire.begin(I2C_PIN_SDA, I2C_PIN_SCL);
+    Wire.setClock(100000);
+    LOG.print("Test1 SHT41 (I2C)... ");
+    if (!testSHT41()) { LOG.println("FAIL"); failLoop(1); }
+    LOG.println("ok"); passIndicate(1);
+
+    // ---- Test 2: WiFi ----
+    LOG.print("Test2 WiFi scan... ");
+    if (!testWiFi()) { LOG.println("FAIL"); failLoop(2); }
+    LOG.println("ok"); passIndicate(2);
+
+    // ---- Test 3: BLE ----
+    LOG.print("Test3 BLE scan... ");
+    if (!testBLE()) { LOG.println("FAIL"); failLoop(3); }
+    LOG.println("ok"); passIndicate(3);
+
+    // ---- Test 4: Battery (never locks) ----
+    LOG.print("Test4 Battery... ");
+    battery_init();
+    Battery_Data b = battery_read();
+    if (b.valid && b.voltage >= BATT_PASS_V) {
+        LOG.printf("%.2fV ok\n", b.voltage);
+        passIndicate(4);
+    } else if (!b.valid || b.voltage < BATT_CONNECTED_V) {
+        LOG.println("N.A. (no battery / gateway) -- skip");
+    } else {
+        LOG.printf("%.2fV LOW (warn)\n", b.voltage);
+    }
+
+    // All good -> both LEDs on 0.5s, then off, and continue to the portal.
+    LOG.println("===== Self-test PASSED =====");
+    powerLed(true); statusLed(true);
+    delay(500);
+    powerLed(false); statusLed(false);
+    return true;
+}
