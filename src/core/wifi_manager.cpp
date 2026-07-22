@@ -12,6 +12,7 @@
 #include "config.h"
 #include "commission.h"
 #include "wifi_policy.h"
+#include "drivers/EspNow.h"   // espnow_gateway_reinit() -- see wifi_ensure_connected()
 
 
 bool wifi_connect() {
@@ -44,7 +45,17 @@ bool wifi_ensure_connected() {
     delay(1000);
 
     bool ok = wifi_connect();
-    if (ok) ntp_sync();
+    if (ok) {
+        // Re-joining the AP tears down ESP-NOW's send-side state (RX keeps
+        // working, but esp_now_send() returns NOT_INIT), so replies/commands to
+        // sensors silently fail -- sensors then retry every wake and never cache
+        // a channel (their wake time balloons ~0.3s -> ~1.8s). The boot path
+        // already re-inits after its first connect; this covers EVERY later
+        // reconnect too. Must run AFTER the join succeeds, not before, or the
+        // fresh join would just tear the send state down again.
+        espnow_gateway_reinit();
+        ntp_sync();
+    }
     return ok;
 }
 
