@@ -24,7 +24,7 @@
 // ------------------------------------------------------------------
 // FIRMWARE / SCHEMA VERSIONS
 // ------------------------------------------------------------------
-#define FIRMWARE_VERSION         "4.4.2"   // serial debug: print wake_ms + room name per reading
+#define FIRMWARE_VERSION         "4.5.0"   // re-init ESP-NOW after WiFi reconnect (fixes sensor wake 300ms->1800ms)
 #define PAYLOAD_VERSION          5         // v5 adds the anti-replay seq counter
 
 
